@@ -4,8 +4,8 @@ set -x
 source consts.sh
 
 DATA_NAME=$1
-DATA_DIR=$ROOT/data/$DATA_NAME
-OUTPUT_DIR=$ROOT/outputs_medium
+DATA_DIR=data/$DATA_NAME
+OUTPUT_DIR=outputs_medium
 
 SEED=$2
 EPOCHS=${3-5}
@@ -28,7 +28,6 @@ python run_clm.py \
     --output_dir $OUTPUT_DIR/${DATA_NAME}_SEED${SEED}_pretrain \
     --logging_steps 100 \
     --save_total_limit 4 \
-    --overwrite_output_dir \
     --evaluation_strategy steps \
     --save_steps 1500 \
     --seed $SEED \

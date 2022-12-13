@@ -1,5 +1,6 @@
 from pathlib import Path
 from hmmlearn.hmm import MultinomialHMM
+from hmm_dist_est import ProbDist, ProbDistVit
 import numpy as np
 import random
 from functools import partial
@@ -8,9 +9,10 @@ from itertools import permutations
 from tqdm import tqdm
 import pickle
 import pandas as pd
+import matplotlib.pyplot as plt
 from tokenizers import Tokenizer
 import contextlib
-from copy import deepcopy
+from copy import deepcopy, copy
 from joblib import Parallel, delayed
 from tokenizers.models import Unigram
 from tokenizers.trainers import UnigramTrainer
@@ -50,6 +52,22 @@ def generate_transmat_block(
     return transmat
 
 
+def generate_similar_transmat_blocks(
+        n_components, perm_samples_num=10, transition_temp=1.0, num=3):
+    transmat_list = []
+    epsilon = 1e-4
+    mixing = softmax(np.random.rand(perm_samples_num) - 0.5, transition_temp)
+    perm_samples = [np.eye(n_components)[np.random.permutation(n_components)] for i in range(perm_samples_num)]
+    transmat_list.append(np.sum(mixing[:, np.newaxis, np.newaxis] * perm_samples, axis=0))
+    for i in range(num-1):
+        mixing_random = copy(mixing)
+        mixing_random[0] = mixing_random[0] + epsilon * random.uniform(0, 1)
+        mixing_random = softmax(mixing_random, transition_temp)
+        mixing_random = mixing_random[:, np.newaxis, np.newaxis]
+        transmat_list.append(np.sum(mixing_random * perm_samples, axis=0))
+    return transmat_list
+
+
 def combine_transmats(mat1, mat2):
     # combine by tiling mat1 and scaling with mat2
     n = mat1.shape[0]
@@ -79,31 +97,61 @@ def generate_hmm_parameters(
     startprob = softmax(np.random.rand(n_components) - 0.5, start_temp)
 
     slot_transmat = generate_transmat_block(
-            n_slots, perm_samples=n_slots, transition_temp=transition_temp)
+        n_slots, perm_samples=n_slots, transition_temp=transition_temp)
 
     if args.prior_values:
         value_transmat = generate_transmat_block(
-                n_values, perm_samples=n_values, transition_temp=transition_temp)
+            n_values, perm_samples=n_values, transition_temp=transition_temp)
         # bias the value transmat towards identity
         value_transmat = (1-value_transmat_id_coeff) * value_transmat + value_transmat_id_coeff * np.eye(n_values)
     else:
         with local_seed(value_transmat_seed):
             value_transmat = generate_transmat_block(
-                    n_values, perm_samples=n_values, transition_temp=transition_temp)
+                n_values, perm_samples=n_values, transition_temp=transition_temp)
             # bias the value transmat towards identity
             value_transmat = (1-value_transmat_id_coeff) * value_transmat + value_transmat_id_coeff * np.eye(n_values)
 
     transmat = combine_transmats(slot_transmat, value_transmat)
 
     # this is actually the same for all hmms, given all_values
-    emissionprob = np.zeros((n_components, n_symbols))
+    epsilon = 1
+    emissionprob = np.ones((n_components, n_symbols)) * (1 - epsilon) / n_symbols
     for i in range(n_components):
         # deterministic given slot and value vector
         slot_idx = i % n_slots
         value_idx = i // n_slots
-        emissionprob[i, all_values[value_idx, slot_idx]] = 1
+        emissionprob[i, all_values[value_idx, slot_idx]] = epsilon
 
     return startprob, transmat, emissionprob, slot_transmat, value_transmat
+
+def generate_similar_hmm_parameters(
+        n_values, n_slots, n_symbols, all_values, transition_temp=1.0,
+        start_temp=1.0, value_transmat_id_coeff=0.8, num_hmms=3):
+    n_components = n_values * n_slots
+    # generate parameters for HMM
+    startprob = softmax(np.random.rand(n_components) - 0.5, start_temp)
+    slot_transmats = generate_similar_transmat_blocks(
+        n_slots, perm_samples_num=n_slots, transition_temp=transition_temp, num=num_hmms)
+
+    value_transmat = generate_transmat_block(
+        n_values, perm_samples=n_values, transition_temp=transition_temp)
+    # bias the value transmat towards identity
+    value_transmat = (1-value_transmat_id_coeff) * value_transmat + value_transmat_id_coeff * np.eye(n_values)
+
+    transmats = [combine_transmats(slot_transmat, value_transmat) for slot_transmat in slot_transmats]
+
+    # this is actually the same for all hmms, given all_values
+    epsilon = 1
+    emissionprob = np.ones((n_components, n_symbols)) * (1 - epsilon) / n_symbols
+    for i in range(n_components):
+        # deterministic given slot and value vector
+        slot_idx = i % n_slots
+        value_idx = i // n_slots
+        emissionprob[i, all_values[value_idx, slot_idx]] = epsilon
+    ret = []
+    for i in range(num_hmms):
+        ret.append((startprob, transmats[i], emissionprob, slot_transmats[i], value_transmat))
+    return ret
 
 
 def sample_from_hmm(hmm, length, seed=None):
@@ -152,7 +200,7 @@ def generate_hiddens_from_state(hmm, start_state, length):
     hiddens = [start_state]
     for i in range(length):
         hiddens.append(
-                np.random.choice(hmm.transmat_.shape[1], p=hmm.transmat_[hiddens[-1], :]))
+            np.random.choice(hmm.transmat_.shape[1], p=hmm.transmat_[hiddens[-1], :]))
     return hiddens
 
 
@@ -173,9 +221,83 @@ def score(hmm, prompt, start_dist=None):
     return proba_next_emission
 
 
+def estimate_pairwise_kl_divergence(hmm1, hmm2):
+    prob_dist = ProbDist(hmm1, hmm2)
+    y = []
+    print("a")
+    for i in range(35, 42):  # 45, 60
+        lp_diff = 0
+        times = 15  # 30
+        for j in range(times):
+            a, _, _ = prob_dist.dist(i)
+            lp_diff += a
+        y.append(lp_diff / times)
+    return np.mean(y)
+
+def plot_estimate_pairwise_kl_divergence(hmm1, hmm2):
+    prob_dist = ProbDist(hmm1, hmm2)
+    x = []
+    y = []
+    lp1 = []
+    lp2 = []
+    for i in range(2,100):
+        x.append(i)
+        a = 0
+        b = 0
+        c = 0
+        times = 20
+        for j in range(times):
+            ap, bp, cp = prob_dist.dist(i)
+            a += ap
+            b += bp
+            c += cp
+        y.append(a / times)
+        lp1.append(b / times)
+        lp2.append(c / times)
+    fig = plt.figure()
+    plt.plot(x, y)
+    plt.title('Distance vs # observationts', fontsize=14)
+    plt.xlabel('number of observations, T', fontsize=14)
+    plt.ylabel('distance', fontsize=14)
+    fig.savefig('dist.png')
+    fig2 = plt.figure()
+    plt.plot(x, lp1, label = 'mu(Ot | lamda 0)')
+    plt.plot(x, lp2, label = 'mu(Ot | lamba)')
+    plt.xlabel('number of observations, T', fontsize=14)
+    plt.ylabel('log probability', fontsize=14)
+    plt.legend()
+    fig2.savefig('log.png')
+    return np.mean(y)
+
+
+def generate_diverse_hmms(hmm_list, n_hmms):
+    L = len(hmm_list)
+    diff_matrix = np.zeros((L, L))
+    for i in range(L):
+        for j in range(L):
+            if i == j:
+                diff_matrix[i][j] = -10
+            else:
+                diff_matrix[i][j] = estimate_pairwise_kl_divergence(hmm_list[i], hmm_list[j])
+    used = {0}
+    while len(used) < n_hmms:
+        ind = -1
+        max = -10
+        for i in range(L):
+            v = 0
+            if i in used:
+                continue
+            for j in used:
+                v = v + diff_matrix[i][j] + diff_matrix[j][i]
+            if v > max:
+                max = v
+                ind = i
+        used.add(ind)
+    return used
+
+
 def make_hmm_pred(prompt, hmms):
     # uniform prior over hmms, take average over prediction probs from each hmm
-
     # probs = Parallel(n_jobs=2)(delayed(score)(hmm) for hmm in hmms)
     probs = []
     for hmm in hmms:
@@ -277,7 +399,6 @@ def generate_prompts(
                     # x y delim pattern
                     slot_pattern = list(np.random.randint(low=1, high=num_slots, size=prompt_length))
                     slot_pattern += [0]
-
                 slots = slot_pattern * (n_examples_per_prompt + 1)
                 values = []
                 for j in range(n_examples_per_prompt + 1):
@@ -357,9 +478,12 @@ if __name__ == "__main__":
     parser.add_argument('--prior_values', action='store_true', help="use prior on values (many value transition matrices)")
     parser.add_argument('--n_train_samples', type=int, default=1000, help="number of training documents")
     parser.add_argument('--prompt_length', type=int, default=None, help="length of [x,y] sequence in prompt examples")
-    parser.add_argument('--n_hmms', type=int, default=100, help="number of total hmms in the mixture")
+    parser.add_argument('--n_hmms', type=int, default=10, help="number of total hmms in the mixture")
+    parser.add_argument('--list_of_n_hmms', type=str, help="generate a list of data files with the latter containing concepts from the prior. List must be ascending order and separated by comma. e.g. 1,3,5,6")
     parser.add_argument('--skip_all_generation', action='store_true', help="whether to skip everything")
     parser.add_argument('--root', type=str, help="root dir")
+    parser.add_argument('--sample_similar_hmm', action='store_true')
+    parser.add_argument('--sample_diver_hmm', action='store_true')
     args = parser.parse_args()
 
     if not args.skip_all_generation:
@@ -378,11 +502,17 @@ if __name__ == "__main__":
         if args.n_train_samples != 1000:
             dataset_id += f'_nsamples{args.n_train_samples}'
 
-        dataset_id += f'_nhmms{args.n_hmms}'
-
-        data_dir = Path(args.root) / 'data'
-        save_dir = data_dir / dataset_id
-        save_dir.mkdir(exist_ok=True, parents=True)
+        if args.sample_similar_hmm:
+            list_of_n_hmms = [args.n_hmms//2]
+            dataset_id_list = [dataset_id + f'_nhmms{args.n_hmms}_least_diverse']
+        elif args.sample_diver_hmm:
+            list_of_n_hmms = [args.n_hmms]
+            dataset_id_list = [dataset_id + f'_nhmms{args.n_hmms}_most_diverse']
+        else:
+            list_of_n_hmms = [int(x) for x in args.list_of_n_hmms.split(",")]
+            if not list_of_n_hmms:
+                list_of_n_hmms = [args.n_hmms]
+            dataset_id_list = [dataset_id + f'_nhmms{i}' for i in list_of_n_hmms]
 
         seed = 1111
         np.random.seed(seed)
@@ -392,8 +522,6 @@ if __name__ == "__main__":
         n_slots = args.n_slots
         n_components = n_values * n_slots
         n_perm_samples = n_components
-        n_hmms = args.n_hmms
-        n_id_hmms = n_hmms // 2
         num_val_samples = 100
         num_train_samples = args.n_train_samples
         sample_length = 10240
@@ -413,100 +541,165 @@ if __name__ == "__main__":
 
         hmm_list = []
         hmm_params = []
-
-        if not args.skip_resample:
-
-            for i in range(n_hmms):
-                startprob, transmat, emissionprob, slot_transmat, value_transmat = generate_hmm_parameters(
-                                                            n_values,
-                                                            n_slots,
-                                                            n_symbols,
-                                                            all_values,
-                                                            perm_samples=n_perm_samples,
-                                                            transition_temp=args.transition_temp,
-                                                            start_temp=args.start_temp,
-                                                            value_transmat_id_coeff=args.value_identity_coeff,
-                                                            value_transmat_seed=seed+3)
+        if args.sample_similar_hmm:
+            list_params = generate_similar_hmm_parameters(
+                n_values,
+                n_slots,
+                n_symbols,
+                all_values,
+                transition_temp=args.transition_temp,
+                start_temp=args.start_temp,
+                value_transmat_id_coeff=args.value_identity_coeff,
+                num_hmms=args.n_hmms//2)
+            for t in list_params:
+                startprob, transmat, emissionprob, slot_transmat, value_transmat = t
                 hmm = MultinomialHMM(n_components=n_components)
                 hmm.startprob_ = startprob
                 hmm.transmat_ = transmat
                 hmm.emissionprob_ = emissionprob
                 hmm_list.append(hmm)
                 hmm_params.append((slot_transmat, value_transmat))
-
-            id_hmms = hmm_list[:n_id_hmms]
-            ood_hmms = hmm_list[n_id_hmms:]
-            id_params = hmm_params[:n_id_hmms]
-            ood_params = hmm_params[n_id_hmms:]
-
-            print("Generating samples")
-            if not args.no_prior_slots:
-                id_samples = generate_samples(
+        else:
+            for i in range(list_of_n_hmms[-1]):
+                startprob, transmat, emissionprob, slot_transmat, value_transmat = generate_hmm_parameters(
+                    n_values,
+                    n_slots,
+                    n_symbols,
+                    all_values,
+                    perm_samples=n_perm_samples,
+                    transition_temp=args.transition_temp,
+                    start_temp=args.start_temp,
+                    value_transmat_id_coeff=args.value_identity_coeff,
+                    value_transmat_seed=seed+3)
+                hmm = MultinomialHMM(n_components=n_components)
+                hmm.startprob_ = startprob
+                hmm.transmat_ = transmat
+                hmm.emissionprob_ = emissionprob
+                hmm_list.append(hmm)
+                hmm_params.append((slot_transmat, value_transmat))
+        for num_hmm, dataset_id in zip(list_of_n_hmms, dataset_id_list):
+            data_dir = Path(args.root) / 'data'
+            save_dir = data_dir / dataset_id
+            save_dir.mkdir(exist_ok=True, parents=True)
+            hmm_list_i = hmm_list[:num_hmm]
+            hmm_params_i = hmm_params[:num_hmm]
+            if not args.skip_resample:
+                if args.sample_similar_hmm:
+                    id_hmms = hmm_list_i
+                    id_params = hmm_params_i
+                    ood_hmms = []
+                    ood_params = []
+                    for i in range(list_of_n_hmms[-1]):
+                        startprob, transmat, emissionprob, slot_transmat, value_transmat = generate_hmm_parameters(
+                            n_values,
+                            n_slots,
+                            n_symbols,
+                            all_values,
+                            perm_samples=n_perm_samples,
+                            transition_temp=args.transition_temp,
+                            start_temp=args.start_temp,
+                            value_transmat_id_coeff=args.value_identity_coeff,
+                            value_transmat_seed=seed+3)
+                        hmm = MultinomialHMM(n_components=n_components)
+                        hmm.startprob_ = startprob
+                        hmm.transmat_ = transmat
+                        hmm.emissionprob_ = emissionprob
+                        ood_hmms.append(hmm)
+                        ood_params.append((slot_transmat, value_transmat))
+                elif args.sample_diver_hmm:
+                    # id_hmms_index = generate_diverse_hmms(hmm_list_i, args.n_hmms//2)
+                    id_hmms_index = generate_diverse_hmms(hmm_list_i, 5)
+                    id_hmms = [hmm_list_i[i] for i in id_hmms_index]
+                    id_params = [hmm_params_i[i] for i in id_hmms_index]
+                    ood_hmms = []
+                    ood_params = []
+                    for i in range(5):
+                        startprob, transmat, emissionprob, slot_transmat, value_transmat = generate_hmm_parameters(
+                            n_values,
+                            n_slots,
+                            n_symbols,
+                            all_values,
+                            perm_samples=n_perm_samples,
+                            transition_temp=args.transition_temp,
+                            start_temp=args.start_temp,
+                            value_transmat_id_coeff=args.value_identity_coeff,
+                            value_transmat_seed=seed+3)
+                        hmm = MultinomialHMM(n_components=n_components)
+                        hmm.startprob_ = startprob
+                        hmm.transmat_ = transmat
+                        hmm.emissionprob_ = emissionprob
+                        ood_hmms.append(hmm)
+                        ood_params.append((slot_transmat, value_transmat))
+                else:
+                    n_id_hmms = num_hmm // 2
+                    id_hmms = hmm_list_i[:num_hmm][:n_id_hmms]
+                    ood_hmms = hmm_list_i[n_id_hmms:]
+                    id_params = hmm_params_i[:n_id_hmms]
+                    ood_params = hmm_params_i[n_id_hmms:]
+                breakpoint()
+                print("Generating samples")
+                if not args.no_prior_slots:
+                    id_samples = generate_samples(
                         num_train_samples, id_hmms,
                         sample_length=sample_length,
                         random_data=args.random_data)
-                id_samples_val = generate_samples(
+                    id_samples_val = generate_samples(
                         num_val_samples, id_hmms,
                         sample_length=val_sample_length,
                         random_data=args.random_data)
-            else:
-                id_samples = generate_samples(
+                else:
+                    id_samples = generate_samples(
                         num_train_samples, [id_hmms[0]],
                         sample_length=sample_length,
                         random_data=args.random_data)
-                id_samples_val = generate_samples(
+                    id_samples_val = generate_samples(
                         num_val_samples, [id_hmms[0]],
                         sample_length=val_sample_length,
                         random_data=args.random_data)
+                # save the hmm parameters for later verification
+                save_hmm_list(id_hmms, save_dir / 'id_hmms.pkl')
+                save_hmm_list(ood_hmms, save_dir / 'ood_hmms.pkl')
+                save_hmm_list(id_params, save_dir / 'id_params.pkl')
+                save_hmm_list(ood_params, save_dir / 'ood_params.pkl')
+                with open(save_dir / 'fixed_params.pkl', 'wb') as f:
+                    pickle.dump(all_values, f)
 
+                save_as_json(id_samples, save_dir / 'train.json')
+                save_as_json(id_samples_val, save_dir / 'val.json')
+                samples_to_raw(id_samples, save_dir / 'train.txt')
+                samples_to_raw(id_samples_val, save_dir / 'val.txt')
+            else:
+                id_hmms = load(save_dir / 'id_hmms.pkl')
+                ood_hmms = load(save_dir / 'ood_hmms.pkl')
+                id_params = load(save_dir / 'id_params.pkl')
+                ood_params = load(save_dir / 'ood_params.pkl')
+                all_values = load(save_dir / 'fixed_params.pkl')
 
-            # save the hmm parameters for later verification
-            save_hmm_list(id_hmms, save_dir / 'id_hmms.pkl')
-            save_hmm_list(ood_hmms, save_dir / 'ood_hmms.pkl')
-            save_hmm_list(id_params, save_dir / 'id_params.pkl')
-            save_hmm_list(ood_params, save_dir / 'ood_params.pkl')
-            with open(save_dir / 'fixed_params.pkl', 'wb') as f:
-                pickle.dump(all_values, f)
+            print("Generate Tokenizer")
 
-            save_as_json(id_samples, save_dir / 'train.json')
-            save_as_json(id_samples_val, save_dir / 'val.json')
-            samples_to_raw(id_samples, save_dir / 'train.txt')
-            samples_to_raw(id_samples_val, save_dir / 'val.txt')
+            tokenizer_path = save_dir / 'tokenizer.json'
+            save_tokenizer_json(vocab, tokenizer_path)
 
+            seed = 1114
+            np.random.seed(seed)
+            random.seed(seed+2)
 
-        else:
-            id_hmms = load(save_dir / 'id_hmms.pkl')
-            ood_hmms = load(save_dir / 'ood_hmms.pkl')
-            id_params = load(save_dir / 'id_params.pkl')
-            ood_params = load(save_dir / 'ood_params.pkl')
-            all_values = load(save_dir / 'fixed_params.pkl')
+            if not args.prompt_length:
+                prompt_lengths = [3, 5, 8, 10]
+            else:
+                prompt_lengths = [args.prompt_length]
 
-        print("Generate Tokenizer")
-
-        tokenizer_path = save_dir / 'tokenizer.json'
-        save_tokenizer_json(vocab, tokenizer_path)
-
-        seed = 1114
-        np.random.seed(seed)
-        random.seed(seed+2)
-
-        if not args.prompt_length:
-            prompt_lengths = [3, 5, 8, 10]
-        else:
-            prompt_lengths = [args.prompt_length]
-
-        for prompt_length in prompt_lengths:
-            id_prompts = generate_prompts(
+            for prompt_length in prompt_lengths:
+                id_prompts = generate_prompts(
                     'ID_sample', n_prompts, n_examples_per_prompts, n_slots,
                     n_values, all_values, id_params, random_sample=True,
                     hmms=id_hmms, prompt_length=prompt_length, id_hmms=id_hmms)
-            save_as_json(id_prompts, save_dir / f'id_prompts_randomsample_{prompt_length}.json')
-            samples_to_raw(id_prompts, save_dir / f'id_prompts_randomsample_{prompt_length}.txt')
+                save_as_json(id_prompts, save_dir / f'id_prompts_randomsample_{prompt_length}.json')
+                samples_to_raw(id_prompts, save_dir / f'id_prompts_randomsample_{prompt_length}.txt')
 
-            ood_prompts = generate_prompts(
-                    'OOD_sample', n_prompts, n_examples_per_prompts, n_slots,
+                ood_prompts = generate_prompts(
+                    'ID_sample', n_prompts, n_examples_per_prompts, n_slots,
                     n_values, all_values, None, random_sample=True,
-                    hmms=ood_hmms, prompt_length=prompt_length,
-                    id_hmms=id_hmms)
-            save_as_json(ood_prompts, save_dir / f'ood_prompts_randomsample_{prompt_length}.json')
-            samples_to_raw(ood_prompts, save_dir / f'ood_prompts_randomsample_{prompt_length}.txt')
+                    hmms=ood_hmms, prompt_length=prompt_length, id_hmms=id_hmms)
+                save_as_json(ood_prompts, save_dir / f'ood_prompts_randomsample_{prompt_length}.json')
+                samples_to_raw(ood_prompts, save_dir / f'ood_prompts_randomsample_{prompt_length}.txt')

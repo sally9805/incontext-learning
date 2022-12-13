@@ -142,3 +142,8 @@ outputs*/
 cache/
 logs/
 *wandb*
+*.tsv
+*.pt
+*.png
+*.pkl
+.idea
